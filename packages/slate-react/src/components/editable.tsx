@@ -222,7 +222,7 @@ export const Editable = (props: EditableProps) => {
           if (range) {
             if (
               !ReactEditor.isComposing(editor) &&
-              !androidInputManager?.hasPendingDiffs() &&
+              !androidInputManager?.hasPendingChanges() &&
               !androidInputManager?.isFlushing()
             ) {
               Transforms.select(editor, range)

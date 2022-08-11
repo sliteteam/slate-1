@@ -23,7 +23,7 @@ import {
   IS_COMPOSING,
 } from '../../utils/weak-maps'
 
-export type Action = { at: Point | Range; run: () => void }
+export type Action = { at?: Point | Range; run: () => void }
 
 // https://github.com/facebook/draft-js/blob/main/src/component/handlers/composition/DraftEditorCompositionHandler.js#L41
 // When using keyboard English association function, conpositionEnd triggered too fast, resulting in after `insertText` still maintain association state.
@@ -48,6 +48,7 @@ export type AndroidInputManager = {
 
   hasPendingDiffs: () => boolean
   hasPendingAction: () => boolean
+  hasPendingChanges: () => boolean
   isFlushing: () => boolean | 'action'
 
   handleUserSelect: (range: Range | null) => void
@@ -62,30 +63,6 @@ export type AndroidInputManager = {
   handleInput: () => void
 }
 
-export function forceSwiftKeyUpdate(editor: ReactEditor) {
-  const { document } = ReactEditor.getWindow(editor)
-  debug('force ime update')
-
-  const div = document.createElement('div')
-  div.setAttribute('contenteditable', 'true')
-  div.setAttribute('display', 'none')
-  div.setAttribute('position', 'absolute')
-  div.setAttribute('top', '0')
-  div.setAttribute('left', '0')
-  div.textContent = ' '
-
-  document.body.appendChild(div)
-  const range = document.createRange()
-  range.selectNodeContents(div)
-  const selection = window.getSelection()
-
-  selection?.removeAllRanges()
-  selection?.addRange(range)
-  div.parentElement?.removeChild(div)
-
-  ReactEditor.focus(editor)
-}
-
 export function createAndroidInputManager({
   editor,
   scheduleOnDOMSelectionChange,
@@ -95,8 +72,9 @@ export function createAndroidInputManager({
   let compositionEndTimeoutId: ReturnType<typeof setTimeout> | null = null
   let flushTimeoutId: ReturnType<typeof setTimeout> | null = null
   let actionTimeoutId: ReturnType<typeof setTimeout> | null = null
+
   let idCounter = 0
-  let isInsertAfterMarkPlaceholder = false
+  let insertPositionHint: StringDiff | null | false = false
 
   const applyPendingSelection = () => {
     const pendingSelection = EDITOR_TO_PENDING_SELECTION.get(editor)
@@ -121,17 +99,19 @@ export function createAndroidInputManager({
       return
     }
 
-    const target = Point.isPoint(action.at)
-      ? normalizePoint(editor, action.at)
-      : normalizeRange(editor, action.at)
+    if (action.at) {
+      const target = Point.isPoint(action.at)
+        ? normalizePoint(editor, action.at)
+        : normalizeRange(editor, action.at)
 
-    if (!target) {
-      return
-    }
+      if (!target) {
+        return
+      }
 
-    const targetRange = Editor.range(editor, target)
-    if (!editor.selection || !Range.equals(editor.selection, targetRange)) {
-      Transforms.select(editor, target)
+      const targetRange = Editor.range(editor, target)
+      if (!editor.selection || !Range.equals(editor.selection, targetRange)) {
+        Transforms.select(editor, target)
+      }
     }
 
     action.run()
@@ -142,6 +122,7 @@ export function createAndroidInputManager({
       clearTimeout(flushTimeoutId)
       flushTimeoutId = null
     }
+
     if (actionTimeoutId) {
       clearTimeout(actionTimeoutId)
       actionTimeoutId = null
@@ -156,6 +137,7 @@ export function createAndroidInputManager({
       flushing = true
       setTimeout(() => (flushing = false))
     }
+
     if (hasPendingAction()) {
       flushing = 'action'
     }
@@ -182,8 +164,8 @@ export function createAndroidInputManager({
         editor.marks = pendingMarks
       }
 
-      if (pendingMarks) {
-        isInsertAfterMarkPlaceholder = true
+      if (pendingMarks && insertPositionHint === false) {
+        insertPositionHint = null
       }
 
       const range = targetRange(diff)
@@ -225,6 +207,7 @@ export function createAndroidInputManager({
     const selection = selectionRef?.unref()
     if (
       selection &&
+      !EDITOR_TO_PENDING_SELECTION.get(editor) &&
       (!editor.selection || !Range.equals(selection, editor.selection))
     ) {
       Transforms.select(editor, selection)
@@ -326,7 +309,11 @@ export function createAndroidInputManager({
     }
   }
 
-  const scheduleAction = (at: Point | Range, run: () => void): void => {
+  const scheduleAction = (
+    run: () => void,
+    { at }: { at?: Point | Range } = {}
+  ): void => {
+    insertPositionHint = false
     debug('scheduleAction', { at, run })
 
     EDITOR_TO_PENDING_SELECTION.delete(editor)
@@ -354,6 +341,14 @@ export function createAndroidInputManager({
     const { inputType: type } = event
     let targetRange: Range | null = null
     const data = (event as any).dataTransfer || event.data || undefined
+
+    if (
+      insertPositionHint !== false &&
+      type !== 'insertText' &&
+      type !== 'insertCompositionText'
+    ) {
+      insertPositionHint = false
+    }
 
     let [nativeTargetRange] = (event as any).getTargetRanges()
     if (nativeTargetRange) {
@@ -403,8 +398,9 @@ export function createAndroidInputManager({
       }
 
       const direction = type.endsWith('Backward') ? 'backward' : 'forward'
-      return scheduleAction(targetRange, () =>
-        Editor.deleteFragment(editor, { direction })
+      return scheduleAction(
+        () => Editor.deleteFragment(editor, { direction }),
+        { at: targetRange }
       )
     }
 
@@ -412,7 +408,9 @@ export function createAndroidInputManager({
       case 'deleteByComposition':
       case 'deleteByCut':
       case 'deleteByDrag': {
-        return scheduleAction(targetRange, () => Editor.deleteFragment(editor))
+        return scheduleAction(() => Editor.deleteFragment(editor), {
+          at: targetRange,
+        })
       }
 
       case 'deleteContent':
@@ -430,7 +428,9 @@ export function createAndroidInputManager({
           }
         }
 
-        return scheduleAction(targetRange, () => Editor.deleteForward(editor))
+        return scheduleAction(() => Editor.deleteForward(editor), {
+          at: targetRange,
+        })
       }
 
       case 'deleteContentBackward': {
@@ -455,58 +455,73 @@ export function createAndroidInputManager({
           })
         }
 
-        return scheduleAction(targetRange, () => Editor.deleteBackward(editor))
-      }
-
-      case 'deleteEntireSoftLine': {
-        return scheduleAction(targetRange, () => {
-          Editor.deleteBackward(editor, { unit: 'line' })
-          Editor.deleteForward(editor, { unit: 'line' })
+        return scheduleAction(() => Editor.deleteBackward(editor), {
+          at: targetRange,
         })
       }
 
+      case 'deleteEntireSoftLine': {
+        return scheduleAction(
+          () => {
+            Editor.deleteBackward(editor, { unit: 'line' })
+            Editor.deleteForward(editor, { unit: 'line' })
+          },
+          { at: targetRange }
+        )
+      }
+
       case 'deleteHardLineBackward': {
-        return scheduleAction(targetRange, () =>
-          Editor.deleteBackward(editor, { unit: 'block' })
+        return scheduleAction(
+          () => Editor.deleteBackward(editor, { unit: 'block' }),
+          { at: targetRange }
         )
       }
 
       case 'deleteSoftLineBackward': {
-        return scheduleAction(targetRange, () =>
-          Editor.deleteBackward(editor, { unit: 'line' })
+        return scheduleAction(
+          () => Editor.deleteBackward(editor, { unit: 'line' }),
+          { at: targetRange }
         )
       }
 
       case 'deleteHardLineForward': {
-        return scheduleAction(targetRange, () =>
-          Editor.deleteForward(editor, { unit: 'block' })
+        return scheduleAction(
+          () => Editor.deleteForward(editor, { unit: 'block' }),
+          { at: targetRange }
         )
       }
 
       case 'deleteSoftLineForward': {
-        return scheduleAction(targetRange, () =>
-          Editor.deleteForward(editor, { unit: 'line' })
+        return scheduleAction(
+          () => Editor.deleteForward(editor, { unit: 'line' }),
+          { at: targetRange }
         )
       }
 
       case 'deleteWordBackward': {
-        return scheduleAction(targetRange, () =>
-          Editor.deleteBackward(editor, { unit: 'word' })
+        return scheduleAction(
+          () => Editor.deleteBackward(editor, { unit: 'word' }),
+          { at: targetRange }
         )
       }
 
       case 'deleteWordForward': {
-        return scheduleAction(targetRange, () =>
-          Editor.deleteForward(editor, { unit: 'word' })
+        return scheduleAction(
+          () => Editor.deleteForward(editor, { unit: 'word' }),
+          { at: targetRange }
         )
       }
 
       case 'insertLineBreak': {
-        return scheduleAction(targetRange, () => Editor.insertSoftBreak(editor))
+        return scheduleAction(() => Editor.insertSoftBreak(editor), {
+          at: targetRange,
+        })
       }
 
       case 'insertParagraph': {
-        return scheduleAction(targetRange, () => Editor.insertBreak(editor))
+        return scheduleAction(() => Editor.insertBreak(editor), {
+          at: targetRange,
+        })
       }
       case 'insertCompositionText':
       case 'deleteCompositionText':
@@ -517,15 +532,15 @@ export function createAndroidInputManager({
       case 'insertReplacementText':
       case 'insertText': {
         if (data?.constructor.name === 'DataTransfer') {
-          return scheduleAction(targetRange, () =>
-            ReactEditor.insertData(editor, data)
-          )
+          return scheduleAction(() => ReactEditor.insertData(editor, data), {
+            at: targetRange,
+          })
         }
 
         if (typeof data === 'string' && data.includes('\n')) {
-          return scheduleAction(Range.end(targetRange), () =>
-            Editor.insertSoftBreak(editor)
-          )
+          return scheduleAction(() => Editor.insertSoftBreak(editor), {
+            at: Range.end(targetRange),
+          })
         }
 
         let text = data ?? ''
@@ -537,39 +552,71 @@ export function createAndroidInputManager({
         }
 
         if (Path.equals(targetRange.anchor.path, targetRange.focus.path)) {
+          const [start, end] = Range.edges(targetRange)
+
           // COMPAT: Swiftkey has a weird bug where the target range of the 2nd word
           // inserted after a mark placeholder is inserted with a anchor offset off by 1.
-          // So writing 'some text' will result in 'some ttext'. If we force a IME update
-          // after inserting the first word, swiftkey will insert with the correct offset
-          if (text.endsWith(' ') && isInsertAfterMarkPlaceholder) {
-            isInsertAfterMarkPlaceholder = false
-            forceSwiftKeyUpdate(editor)
-            return scheduleAction(targetRange, () =>
-              Editor.insertText(editor, text)
-            )
+          // So writing 'some text' will result in 'some ttext'. Luckily all 'normal' insert
+          // text events are fired with the correct target ranges, only the final 'insertComposition'
+          // isn't, so we can just ignore it if we re 100% certain it's the incorrect insert.
+          if (
+            text &&
+            insertPositionHint &&
+            type === 'insertCompositionText' &&
+            insertPositionHint.text.endsWith(text) &&
+            insertPositionHint.start === start.offset - 1 &&
+            insertPositionHint.end === end.offset
+          ) {
+            scheduleFlush()
+            debug('ignore swiftKey replace')
+            insertPositionHint = false
+            return
           }
 
-          const [start, end] = Range.edges(targetRange)
-          return storeDiff(start.path, {
+          const diff = {
             start: start.offset,
             end: end.offset,
             text,
-          })
+          }
+
+          if (type === 'insertText' && insertPositionHint === null) {
+            insertPositionHint = diff
+          } else if (
+            insertPositionHint &&
+            type === 'insertText' &&
+            Range.isCollapsed(targetRange) &&
+            insertPositionHint.end + insertPositionHint.text.length ===
+              start.offset
+          ) {
+            insertPositionHint = {
+              ...insertPositionHint,
+              text: insertPositionHint.text + text,
+            }
+          } else {
+            insertPositionHint = false
+          }
+
+          storeDiff(start.path, diff)
+          return
         }
 
-        return scheduleAction(targetRange, () =>
-          Editor.insertText(editor, text)
-        )
+        return scheduleAction(() => Editor.insertText(editor, text), {
+          at: targetRange,
+        })
       }
     }
   }
 
   const hasPendingAction = () => {
-    return !!EDITOR_TO_PENDING_ACTION.get(editor) || !!actionTimeoutId
+    return !!EDITOR_TO_PENDING_ACTION.get(editor)
   }
 
   const hasPendingDiffs = () => {
     return !!EDITOR_TO_PENDING_DIFFS.get(editor)?.length
+  }
+
+  const hasPendingChanges = () => {
+    return hasPendingAction() || hasPendingDiffs()
   }
 
   const isFlushing = () => {
@@ -590,7 +637,7 @@ export function createAndroidInputManager({
         !Path.equals(editor.selection.anchor.path, range?.anchor.path))
 
     if (pathChanged) {
-      isInsertAfterMarkPlaceholder = false
+      insertPositionHint = false
     }
 
     if (pathChanged || !hasPendingDiffs()) {
@@ -643,6 +690,8 @@ export function createAndroidInputManager({
 
     hasPendingDiffs,
     hasPendingAction,
+    hasPendingChanges,
+
     isFlushing,
 
     handleUserSelect,
