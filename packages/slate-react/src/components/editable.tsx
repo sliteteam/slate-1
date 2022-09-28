@@ -765,12 +765,11 @@ export const Editable = (props: EditableProps) => {
 
   if (editor.selection && Range.isCollapsed(editor.selection) && marks) {
     const { anchor } = editor.selection
-    const leaf = Node.leaf(editor, anchor.path)
-    const { text, ...rest } = leaf
+    const { text, key, ...rest } = Node.leaf(editor, anchor.path) as any
 
     // While marks isn't a 'complete' text, we can still use loose Text.equals
     // here which only compares marks anyway.
-    if (!Text.equals(leaf, marks as Text, { loose: true })) {
+    if (!Text.equals(rest as Text, marks as Text, { loose: true })) {
       state.hasMarkPlaceholder = true
 
       const unset = Object.fromEntries(
@@ -795,11 +794,11 @@ export const Editable = (props: EditableProps) => {
       const { selection } = editor
       if (selection) {
         const { anchor } = selection
-        const text = Node.leaf(editor, anchor.path)
+        const { text, key, ...rest } = Node.leaf(editor, anchor.path) as any
 
         // While marks isn't a 'complete' text, we can still use loose Text.equals
         // here which only compares marks anyway.
-        if (marks && !Text.equals(text, marks as Text, { loose: true })) {
+        if (marks && !Text.equals(rest, marks as Text, { loose: true })) {
           EDITOR_TO_PENDING_INSERTION_MARKS.set(editor, marks)
           return
         }
